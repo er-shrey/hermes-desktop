@@ -942,10 +942,9 @@ describe("session cache provenance", () => {
     ]);
   });
 
-  it("paints a pre-provenance cache, then rebuilds it on the next sync", () => {
-    // Upgrading users keep their instant sidebar paint (an unstamped cache is
-    // not known to be wrong), and the next sync rebuilds the visible set from
-    // the database, which drops rows it no longer has and stamps the result.
+  it("waits for authoritative sync before painting a pre-provenance cache", () => {
+    // Upgrade preserves the file, but only successful DB reads can establish
+    // which history belongs to the current profile/database.
     const now = Math.floor(Date.now() / 1000);
     seedDb([
       {
@@ -960,13 +959,21 @@ describe("session cache provenance", () => {
       { id: DESK_ID, title: "Real" },
     ]);
 
-    expect(listCachedSessions(20).map((s) => s.id)).toEqual([
-      "ghost-session",
-      DESK_ID,
-    ]);
+    expect(listCachedSessions(20)).toEqual([]);
 
     expect(syncSessionCache().map((s) => s.id)).toEqual([DESK_ID]);
     expect(listCachedSessions(20).map((s) => s.id)).toEqual([DESK_ID]);
+  });
+
+  it("rejects unstamped legacy rows when the existing database cannot be opened", () => {
+    mkdirSync(TEST_HOME, { recursive: true });
+    writeFileSync(DB_PATH, "CORRUPT", "utf-8");
+    writeLegacyCache([{ id: DESK_ID, title: "PONG" }]);
+    expect(listCachedSessions(20)).toEqual([]);
+    expect(syncSessionCache()).toEqual([]);
+    expect(
+      JSON.parse(readFileSync(CACHE_FILE, "utf-8")).source,
+    ).toBeUndefined();
   });
 
   it("validates each profile's cache against its own database", () => {

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import {
   activeStateDbPath,
@@ -15,7 +15,11 @@ import {
   validateNormalizedSessionTitle,
 } from "../shared/session-title";
 import { getAppLocale } from "./locale";
-import { getDbConnection, sessionVisibilityPredicate } from "./db";
+import {
+  getDbConnection,
+  sessionVisibilityPredicate,
+  stateDbFileIdentity,
+} from "./db";
 import { getSessionContextFolders } from "./session-context-folder-store";
 
 // Re-export for callers/docs that historically imported the cap from here.
@@ -65,7 +69,7 @@ interface CacheSource {
   profile: string;
   dbPath: string;
   /**
-   * Inode and creation time of `state.db`. Deliberately *not* size or mtime:
+   * Device, inode and creation time of `state.db`. Deliberately *not* size or mtime:
    * those change on every write during normal use and would invalidate the
    * cache constantly. Inode and birth time change only when the file is
    * replaced, which is exactly the event this needs to catch.
@@ -92,16 +96,14 @@ function currentCacheSource(profile?: unknown): CacheSource | null {
       ? getActiveProfileNameSync()
       : profile;
   const dbPath = activeStateDbPath(selectedProfile);
-  try {
-    const stats = statSync(dbPath);
-    return {
-      profile: String(selectedProfile),
-      dbPath,
-      dbId: `${stats.ino}:${Math.floor(stats.birthtimeMs)}`,
-    };
-  } catch {
-    return null;
-  }
+  const dbId = stateDbFileIdentity(dbPath);
+  return dbId
+    ? {
+        profile: String(selectedProfile),
+        dbPath,
+        dbId,
+      }
+    : null;
 }
 
 function sameSource(a: CacheSource, b: CacheSource): boolean {
@@ -174,11 +176,11 @@ function readCache(profile?: unknown): CacheData {
     // The cache belongs to a different database. Drop it outright and let the
     // next sync rebuild from the live one.
     //
-    // A cache with no stamp at all predates this check. It is not known to be
-    // wrong, so its rows still paint and upgrading users keep their instant
-    // sidebar; `syncSessionCache` rebuilds the visible set from the database
-    // on the very next run either way, which stamps it from then on.
-    if (stored && !sameSource(stored, current)) {
+    // An unstamped legacy cache has no evidence tying any row to this DB.
+    // Preserve the file for upgrade recovery, but only a successful sync may
+    // rebuild and stamp it. Both fast paint and unavailable-DB fallbacks must
+    // reject it, regardless of session ID shape or title.
+    if (!stored || !sameSource(stored, current)) {
       return { sessions: [], lastSync: 0, source: current };
     }
 
@@ -198,16 +200,13 @@ function readCache(profile?: unknown): CacheData {
   }
 }
 
-// Always stamp the cache with the database it was built from, so the next
-// read can verify it. A write with no resolvable source (state.db vanished
-// mid-run) is left unstamped, which `readCache` treats as unverifiable.
+// Only write data whose source is already proven. Re-stat immediately before
+// writing so a rename/replacement during sync cannot stamp old rows as new.
 function writeCache(data: CacheData, profile?: unknown): void {
   try {
-    const source = data.source ?? currentCacheSource(profile);
-    safeWriteFile(
-      cacheFilePath(profile),
-      JSON.stringify(source ? { ...data, source } : data),
-    );
+    const current = currentCacheSource(profile);
+    if (!data.source || !current || !sameSource(data.source, current)) return;
+    safeWriteFile(cacheFilePath(profile), JSON.stringify(data));
   } catch {
     // non-fatal
   }
@@ -238,6 +237,7 @@ function attachContextFolders(
 // Reconcile visible session metadata; archive changes do not update started_at.
 export function syncSessionCache(profile?: unknown): CachedSession[] {
   const cache = readCache(profile);
+  const source = currentCacheSource(profile);
   const db = getDb(profile);
   // `readCache` has already discarded rows that don't belong to this
   // profile's live state DB, so both of this function's fallbacks (here, and
@@ -246,7 +246,7 @@ export function syncSessionCache(profile?: unknown): CachedSession[] {
   // *missing* state.db emptied the cache above, while a database that merely
   // cannot be opened right now — locked, or a startup with no gateway
   // reachable — leaves the cache intact and still renders the user's history.
-  if (!db) return cache.sessions;
+  if (!db) return readCache(profile).sessions;
 
   try {
     // Read the complete visible set so old sessions can disappear on archive
@@ -323,15 +323,20 @@ export function syncSessionCache(profile?: unknown): CachedSession[] {
     const allSessions = attachContextFolders(visibleSessions, profile);
     allSessions.sort((a, b) => b.startedAt - a.startedAt);
 
+    const current = currentCacheSource(profile);
+    if (!source || !current || !sameSource(source, current))
+      return readCache(profile).sessions;
+
     const updated: CacheData = {
       sessions: allSessions,
       lastSync: Math.floor(Date.now() / 1000),
+      source,
     };
     writeCache(updated, profile);
     return updated.sessions;
   } catch {
     // Same guarantee as the `!db` path above: already provenance-checked.
-    return cache.sessions;
+    return readCache(profile).sessions;
   }
 }
 
