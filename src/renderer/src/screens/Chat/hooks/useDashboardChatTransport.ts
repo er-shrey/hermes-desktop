@@ -116,6 +116,7 @@ interface UseDashboardChatTransportArgs {
 interface UseDashboardChatTransportResult {
   abort: () => void;
   enabled: boolean;
+  respondClarify: (requestId: string, answer: string) => Promise<boolean>;
   respondApproval: (
     requestId: string,
     choice: ApprovalChoice,
@@ -146,6 +147,7 @@ interface PendingDashboardApproval {
   gatewayRequestId: string | null;
   requestId: string;
   responding: boolean;
+  completed?: boolean;
   sessionId: string;
 }
 
@@ -606,7 +608,22 @@ export function dashboardModelMatches(
 
   // Named custom providers can be reported by Hermes Agent as custom:<slug>
   // while Hermes One's older model config still treats them as custom rows.
-  return provider === "custom" && liveProvider.startsWith("custom:");
+  if (provider === "custom" && liveProvider.startsWith("custom:")) return true;
+
+  // The reverse direction: a named providers: entry (e.g. "omlx") comes
+  // back normalized to the bare custom namespace; accept only the row the
+  // server marks current, not merely one that lists the same model.
+  if (liveProvider === "custom" || liveProvider.startsWith("custom:")) {
+    const namedRow = (live?.providers ?? []).find(
+      (row) =>
+        row.is_current &&
+        ((row.slug || "").toLowerCase() === provider ||
+          (row.slug || "").toLowerCase() === `custom:${provider}`),
+    );
+    if (namedRow) return true;
+  }
+
+  return false;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -960,7 +977,12 @@ export function useDashboardChatTransport({
   const appliedModelRef = useRef<string | null>(null);
   const recreateRuntimeSessionRef = useRef(false);
   const lastRuntimeSessionWasCreatedRef = useRef(false);
-  const pendingClarifyRequestIdRef = useRef<string | null>(null);
+  const pendingClarifyRef = useRef<{
+    requestId: string;
+    sessionId: string | null;
+    responding: boolean;
+    activeTurn: ActiveTurn | null;
+  } | null>(null);
   const pendingApprovalsRef = useRef<PendingDashboardApproval[]>([]);
   const approvalNonceRef = useRef(0);
   const pendingRecoveredContinuationRef = useRef<
@@ -1014,15 +1036,56 @@ export function useDashboardChatTransport({
     [cancelScheduledFlush, setMessages],
   );
 
-  const expirePendingApprovalsRef = useRef<(failActiveTurn?: boolean) => void>(
+  const expirePendingClarifyRef = useRef<(failActiveTurn?: boolean) => void>(
     () => undefined,
   );
-  expirePendingApprovalsRef.current = (failActiveTurn = false): void => {
-    if (pendingApprovalsRef.current.length === 0) return;
-    const pendingIds = new Set(
-      pendingApprovalsRef.current.map(({ requestId }) => requestId),
+  expirePendingClarifyRef.current = (failActiveTurn = false): void => {
+    const pending = pendingClarifyRef.current;
+    pendingClarifyRef.current = null;
+    if (!pending) return;
+    if (
+      failActiveTurn &&
+      pending.responding &&
+      activeTurnRef.current === pending.activeTurn
+    ) {
+      if (activeTurnRef.current) activeTurnRef.current.status = "failed";
+      activeTurnRef.current = null;
+      setToolProgress(null);
+      setIsLoading(false);
+    }
+    setMessages((current) =>
+      current.map((message) =>
+        message.kind === "clarify" &&
+        message.responsePath === "dashboard" &&
+        message.requestId === pending.requestId &&
+        !message.resolved
+          ? { ...message, unavailable: true }
+          : message,
+      ),
     );
-    pendingApprovalsRef.current = [];
+  };
+
+  const expirePendingApprovalsRef = useRef<
+    (failActiveTurn?: boolean, preserveResponding?: boolean) => void
+  >(() => undefined);
+  expirePendingApprovalsRef.current = (
+    failActiveTurn = false,
+    preserveResponding = false,
+  ): void => {
+    if (pendingApprovalsRef.current.length === 0) return;
+    const pendingIds = new Set<string>();
+    pendingApprovalsRef.current = pendingApprovalsRef.current.filter(
+      (pending) => {
+        // Turn completion can precede the response RPC acknowledgement. Keep
+        // only decisions already in flight; unanswered requests still expire.
+        if (preserveResponding && pending.responding) {
+          pending.completed = true;
+          return true;
+        }
+        pendingIds.add(pending.requestId);
+        return false;
+      },
+    );
     setMessages((current) => {
       const unavailable = current.map((message) =>
         message.kind === "approval" &&
@@ -1052,7 +1115,10 @@ export function useDashboardChatTransport({
   useEffect(() => {
     // Clearing the transcript invalidates pending cards without copying a
     // potentially stale React snapshot back over coalesced stream deltas.
-    if (messagesRef.current.length === 0) pendingApprovalsRef.current = [];
+    if (messagesRef.current.length === 0) {
+      pendingApprovalsRef.current = [];
+      pendingClarifyRef.current = null;
+    }
   });
 
   useEffect(() => {
@@ -1064,7 +1130,7 @@ export function useDashboardChatTransport({
     appliedModelRef.current = null;
     recreateRuntimeSessionRef.current = false;
     lastRuntimeSessionWasCreatedRef.current = false;
-    pendingClarifyRequestIdRef.current = null;
+    expirePendingClarifyRef.current();
     lastSyncedCwdRef.current = null;
   }, [hermesSessionId]);
 
@@ -1084,7 +1150,7 @@ export function useDashboardChatTransport({
     appliedModelRef.current = null;
     recreateRuntimeSessionRef.current = false;
     lastRuntimeSessionWasCreatedRef.current = false;
-    pendingClarifyRequestIdRef.current = null;
+    expirePendingClarifyRef.current();
     pendingRecoveredContinuationRef.current = [];
     lastSyncedCwdRef.current = null;
   }, [connectionId, connectionMode, connectionRevision, profile]);
@@ -1146,6 +1212,19 @@ export function useDashboardChatTransport({
             )
           : undefined;
       if (approvalRequestId) {
+        // Replayed terminal cards must not re-enter the FIFO queue: their UI
+        // cannot be answered again, so they would block every later request.
+        const previous = messagesRef.current.find(
+          (message) =>
+            message.kind === "approval" &&
+            message.responsePath === "dashboard" &&
+            message.requestId === approvalRequestId,
+        );
+        if (
+          previous?.kind === "approval" &&
+          (previous.resolved || previous.unavailable)
+        )
+          return;
         const sessionId = event.session_id || runtimeSessionId;
         if (sessionId) {
           if (
@@ -1222,7 +1301,10 @@ export function useDashboardChatTransport({
       }
 
       if (event.type === "message.complete") {
-        expirePendingApprovalsRef.current();
+        // A reply RPC can be acknowledged after the resumed turn finishes.
+        if (!pendingClarifyRef.current?.responding)
+          expirePendingClarifyRef.current();
+        expirePendingApprovalsRef.current(false, true);
         if (failed) {
           appliedModelRef.current = null;
           recreateRuntimeSessionRef.current = true;
@@ -1279,19 +1361,46 @@ export function useDashboardChatTransport({
         }
       }
 
-      if (event.type === "clarify.request") {
+      if (event.type === "clarify.expire" || event.type === "clarify.request") {
         const payload =
           event.payload && typeof event.payload === "object"
             ? (event.payload as { request_id?: unknown })
             : {};
         const requestId =
           typeof payload.request_id === "string" ? payload.request_id : "";
-        if (requestId) {
-          pendingClarifyRequestIdRef.current = requestId;
-          activeTurnRef.current = null;
-          setToolProgress(null);
-          setIsLoading(false);
+        const pending = pendingClarifyRef.current;
+        if (event.type === "clarify.expire") {
+          if (!requestId || pending?.requestId !== requestId) return;
+          expirePendingClarifyRef.current();
+          // The Agent's blocking prompt returns on timeout and the original
+          // turn resumes. Keep tracking it until message.complete arrives.
+          if (pending.activeTurn?.status === "running") {
+            activeTurnRef.current = pending.activeTurn;
+            setIsLoading(true);
+          }
+          return;
         }
+        // Replays must not retire a newer question or clear a turn that has
+        // already resumed while its answer RPC is still being acknowledged.
+        if (!requestId || pending?.requestId === requestId) return;
+        const card = messagesRef.current.find(
+          (message) =>
+            message.kind === "clarify" &&
+            message.responsePath === "dashboard" &&
+            message.requestId === requestId,
+        );
+        if (card?.kind !== "clarify" || card.resolved || card.unavailable)
+          return;
+        expirePendingClarifyRef.current();
+        pendingClarifyRef.current = {
+          requestId,
+          sessionId: runtimeSessionId,
+          responding: false,
+          activeTurn: activeTurnRef.current,
+        };
+        activeTurnRef.current = null;
+        setToolProgress(null);
+        setIsLoading(false);
       }
     },
     [
@@ -1366,6 +1475,7 @@ export function useDashboardChatTransport({
             onEvent: handleGatewayEvent,
             onClose: () => {
               if (clientRef.current === client) {
+                expirePendingClarifyRef.current(true);
                 expirePendingApprovalsRef.current(true);
                 clientRef.current = null;
               }
@@ -1649,21 +1759,79 @@ export function useDashboardChatTransport({
     [],
   );
 
+  const respondClarify = useCallback(
+    async (requestId: string, answer: string): Promise<boolean> => {
+      const pending = pendingClarifyRef.current;
+      const client = clientRef.current;
+      if (
+        !enabled ||
+        !pending ||
+        pending.requestId !== requestId ||
+        pending.responding ||
+        pending.sessionId !== runtimeSessionIdRef.current ||
+        !client?.connected
+      )
+        return false;
+      pending.responding = true;
+      activeTurnRef.current = pending.activeTurn;
+      setIsLoading(true);
+      try {
+        const result = await client.request<{ status?: string }>(
+          "clarify.respond",
+          { request_id: requestId, answer },
+        );
+        if (
+          !pendingClarifyRef.current ||
+          pending.sessionId !== runtimeSessionIdRef.current ||
+          clientRef.current !== client
+        )
+          return false;
+        if (result?.status !== "ok") {
+          if (pendingClarifyRef.current === pending) {
+            setIsLoading(false);
+            activeTurnRef.current = null;
+            expirePendingClarifyRef.current();
+          }
+          return false;
+        }
+        if (pendingClarifyRef.current === pending)
+          pendingClarifyRef.current = null;
+        setMessages((current) =>
+          current.map((message) =>
+            message.kind === "clarify" &&
+            message.responsePath === "dashboard" &&
+            message.requestId === requestId
+              ? { ...message, answer, resolved: true, unavailable: false }
+              : message,
+          ),
+        );
+        return true;
+      } catch {
+        if (pendingClarifyRef.current === pending) {
+          setIsLoading(false);
+          activeTurnRef.current = null;
+        }
+        return false;
+      } finally {
+        pending.responding = false;
+      }
+    },
+    [enabled, setMessages, activeTurnRef, setIsLoading],
+  );
+
   const sendMessage = useCallback(
     async (text: string, attachments?: Attachment[]): Promise<boolean> => {
       if (!enabled) return false;
-      const pendingClarifyRequestId = pendingClarifyRequestIdRef.current;
+      const pendingClarifyRequestId = pendingClarifyRef.current?.requestId;
       if (pendingClarifyRequestId) {
-        pendingClarifyRequestIdRef.current = null;
         try {
-          const client = await ensureClient();
-          await client.request("clarify.respond", {
-            request_id: pendingClarifyRequestId,
-            answer: text,
-          });
+          if (!(await respondClarify(pendingClarifyRequestId, text))) {
+            throw new Error(
+              "Could not deliver the clarification answer. Retry from the question card.",
+            );
+          }
           return true;
         } catch (err) {
-          pendingClarifyRequestIdRef.current = pendingClarifyRequestId;
           const message = err instanceof Error ? err.message : String(err);
           const activeTurn = activeTurnRef.current;
           if (activeTurn) activeTurn.status = "failed";
@@ -1675,6 +1843,11 @@ export function useDashboardChatTransport({
           setIsLoading(false);
           return true;
         }
+      }
+      // A late reply from the completed turn must not affect a new prompt
+      // using the same runtime session, especially on an unresolved ACK.
+      if (pendingApprovalsRef.current.some((pending) => pending.completed)) {
+        expirePendingApprovalsRef.current();
       }
       const dashboardText = dashboardPromptTextForAttachments(
         text,
@@ -1842,6 +2015,7 @@ export function useDashboardChatTransport({
     },
     [
       activeTurnRef,
+      respondClarify,
       connectionMode,
       enabled,
       fallbackOnUnavailable,
@@ -1895,8 +2069,23 @@ export function useDashboardChatTransport({
           return false;
         }
         pendingApprovalsRef.current = pendingApprovalsRef.current.slice(1);
+        // Record the acknowledgement before a replay can arrive, rather than
+        // waiting for the card's asynchronous onResolved callback.
+        setMessages((current) =>
+          current.map((message) =>
+            message.kind === "approval" &&
+            message.responsePath === "dashboard" &&
+            message.requestId === requestId
+              ? { ...message, choice, resolved: true }
+              : message,
+          ),
+        );
         return true;
       } catch {
+        if (pending.completed && pendingApprovalsRef.current[0] === pending) {
+          // A completed turn cannot accept a retry after an unconfirmed reply.
+          expirePendingApprovalsRef.current();
+        }
         return false;
       } finally {
         if (pendingApprovalsRef.current[0] === pending) {
@@ -1904,7 +2093,7 @@ export function useDashboardChatTransport({
         }
       }
     },
-    [enabled],
+    [enabled, setMessages],
   );
 
   const execSlash = useCallback(
@@ -1973,6 +2162,7 @@ export function useDashboardChatTransport({
   );
 
   const abort = useCallback(() => {
+    expirePendingClarifyRef.current();
     expirePendingApprovalsRef.current();
     const client = clientRef.current;
     const sessionId = runtimeSessionIdRef.current;
@@ -1986,6 +2176,7 @@ export function useDashboardChatTransport({
 
   useEffect(
     () => () => {
+      expirePendingClarifyRef.current();
       expirePendingApprovalsRef.current();
       clientRef.current?.close();
       clientRef.current = null;
@@ -1997,6 +2188,7 @@ export function useDashboardChatTransport({
     abort,
     enabled,
     respondApproval,
+    respondClarify,
     sendMessage,
     execSlash,
     getCommandCatalog,
