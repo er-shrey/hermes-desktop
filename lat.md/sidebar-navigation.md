@@ -64,6 +64,8 @@ A stamped cache remains available during database-open failure when its selected
 
 A database swapped at the same path invalidates the cache and cached SQLite handle, so the next sync reads the replacement rather than republishing the old connection's rows.
 
+[[tests/db.test.ts]] preserves the existing path, read-only mode and close checks with file-generation fixtures; the SQLite replacement regression above verifies the behavior against an actual database.
+
 ### Mid-sync replacement
 
 Replacing state.db during an actual row query discards that query result, leaves the old stamp untouched, and allows the next successful sync to rebuild from the new file generation.
